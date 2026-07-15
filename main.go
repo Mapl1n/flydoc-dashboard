@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -79,6 +80,12 @@ func main() {
 			return
 		}
 
+		// Sync endpoint: Pipeline → RAG
+		if path == "/sync" {
+			syncPipelineToRAG(w, r)
+			return
+		}
+
 		// Dashboard homepage
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(dashboardHTML))
@@ -97,6 +104,48 @@ func main() {
 	fmt.Println()
 
 	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+// syncPipelineToRAG fetches all Pipeline-processed docs and feeds them to RAG
+func syncPipelineToRAG(w http.ResponseWriter, r *http.Request) {
+	// 1. Fetch Pipeline docs
+	resp, err := http.Get("http://localhost:8082/api/documents")
+	if err != nil {
+		fmt.Fprintf(w, `{"ok":false,"error":"Pipeline unreachable: %v"}`, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var pipeResult struct {
+		Code int `json:"code"`
+		Data []struct {
+			Filename string `json:"filename"`
+			Category string `json:"category"`
+			Text     string `json:"text"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&pipeResult); err != nil {
+		fmt.Fprintf(w, `{"ok":false,"error":"decode: %v"}`, err)
+		return
+	}
+
+	// 2. For each doc, send full text to RAG
+	count := 0
+	for _, doc := range pipeResult.Data {
+		body, _ := json.Marshal(map[string]string{
+			"text":     doc.Text,
+			"filename": fmt.Sprintf("[%s] %s", doc.Category, doc.Filename),
+		})
+		resp, err := http.Post("http://localhost:8081/api/documents/text",
+			"application/json",
+			strings.NewReader(string(body)))
+		if err == nil {
+			resp.Body.Close()
+			count++
+		}
+	}
+
+	fmt.Fprintf(w, `{"ok":true,"synced":%d,"total":%d}`, count, len(pipeResult.Data))
 }
 
 const dashboardHTML = `<!DOCTYPE html>
@@ -244,6 +293,7 @@ body {
   <h1>📂 FlyDoc 智能档案平台</h1>
   <p>基于 Go + ElasticSearch + Ollama + Tika 的智能档案处理解决方案<br>三大项目，一个入口，零依赖运行</p>
 </div>
+  <div style="margin-top:14px;text-align:center"><button onclick="syncPipeline()" style="padding:10px 24px;border-radius:10px;border:1px solid #334155;background:#1e293b;color:#e2e8f0;cursor:pointer;font-size:14px;font-weight:500;transition:all .2s" onmouseover="this.style.borderColor="#3b82f6"" onmouseout="this.style.borderColor="#334155"">🔄 同步流水线文档 → RAG 检索引擎</button><span id="syncMsg" style="font-size:12px;color:#64748b;margin-left:12px"></span></div>
 
 <div class="cards">
 
@@ -305,4 +355,7 @@ body {
   </a>
 </div>
 
+<script>
+async function syncPipeline(){var m=document.getElementById('syncMsg');m.textContent='Syncing...';try{var r=await fetch('/sync');var d=await r.json();m.textContent=d.ok?'Synced '+d.synced+'/'+d.total+' docs to RAG':'Error: '+d.error;m.style.color=d.ok?'var(--green)':'var(--red)'}catch(e){m.textContent='Failed: '+e.message;m.style.color='red'}}
+</script>
 </body></html>`
